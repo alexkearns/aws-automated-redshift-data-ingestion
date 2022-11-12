@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a single node Redshift cluster, compatible with the Redshift Data API"
+
+Parameters:
+  ClusterDatabaseName:
+    Type: "String"
+    Description: "The name of the database to create on the Redshift cluster"
+    Default: "demo_db"
+
+Resources:
+  RedshiftIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "data-platform-redshift-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "redshift.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !ImportValue "DataPlatformSourceBucketArn"
+                  - !Join ["", [!ImportValue "DataPlatformSourceBucketArn", "/*"]]
+
+
+  RedshiftAdminUserSecret:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: "Administrator credentials for the Redshift cluster"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "db_admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+  
+  RedshiftClusterSubnetGroup:
+    Type: "AWS::Redshift::ClusterSubnetGroup"
+    Properties:
+      Description: "The cluster subnet group for the main Redshift cluster"
+      SubnetIds:
+        - !ImportValue "DataPlatformSubnetId"
+      Tags:
+        - Key: "Name"
+          Value: !Sub "dataplatform-redshift-cluster-subnet-group-${AWS::Region}"
+          
+  RedshiftCluster:
+    Type: "AWS::Redshift::Cluster"
+    Properties:
+      ClusterIdentifier: !Sub "dataplatform-redshift-cluster-${AWS::Region}"
+      DBName: !Ref "ClusterDatabaseName"
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RedshiftAdminUserSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RedshiftAdminUserSecret, ':SecretString:password}}' ]]
+      NodeType: "dc2.large"
+      ClusterType: "single-node"
+      ClusterSubnetGroupName: !Ref "RedshiftClusterSubnetGroup"
+      PubliclyAccessible: false
+      IamRoles:
+        - !GetAtt "RedshiftIamRole.Arn"

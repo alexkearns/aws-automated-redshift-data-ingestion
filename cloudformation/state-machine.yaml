@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a single node Redshift cluster, compatible with the Redshift Data API"
+
+Parameters:
+  ClusterDatabaseName:
+    Type: "String"
+    Description: "The name of the database to create on the Redshift cluster"
+    Default: "demo_db"
+
+Resources:
+  EventBridgeRuleRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "states:StartExecution"
+                Resource:
+                  - !GetAtt "DataPipelineStateMachine.Arn"
+
+  EventBridgeRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      State: ENABLED
+      EventPattern:
+        source: 
+          - aws.s3
+        detail-type:
+          - "Object Created"
+        account:
+          - !Ref "AWS::AccountId"
+        detail:
+          bucket:
+            name:
+              - !ImportValue "DataPlatformSourceBucketName"
+      Targets:
+        - Id: "RedshiftQueryStateMachine"
+          RoleArn: !GetAtt "EventBridgeRuleRole.Arn"
+          Arn: !GetAtt "DataPipelineStateMachine.Arn"
+          InputTransformer:
+            InputPathsMap:
+              bucket: "$.detail.bucket.name"
+              key: "$.detail.object.key"
+            InputTemplate: >-
+              {"bucket": <bucket>, "key": <key>}
+
+
+  StateMachineIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "redshift:GetClusterCredentials"
+                Resource:
+                  - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:dataplatform-redshift-cluster-${AWS::Region}/${ClusterDatabaseName}"
+                  - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:dataplatform-redshift-cluster-${AWS::Region}/db_admin"
+              - Effect: "Allow"
+                Action:
+                  - "redshift-data:ExecuteStatement"
+                Resource:
+                  - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:dataplatform-redshift-cluster-${AWS::Region}"
+              - Effect: "Allow"
+                Action:
+                  - "redshift-data:DescribeStatement"
+                Resource:
+                  - "*"
+
+  DataPipelineStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      RoleArn: !GetAtt "StateMachineIamRole.Arn"
+      Definition:
+        StartAt: "Execute Redshift query"
+        States:
+          Execute Redshift query:
+            Type: "Task"
+            Resource: "arn:aws:states:::aws-sdk:redshiftdata:executeStatement"
+            Parameters:
+              ClusterIdentifier: !Sub "dataplatform-redshift-cluster-${AWS::Region}"
+              Database: !Ref "ClusterDatabaseName"
+              DbUser: "db_admin"
+              Sql.$: !Sub States.Format('COPY public.data_loading_demo FROM \'s3://{}/{}\' IAM_ROLE \'arn:aws:iam::${AWS::AccountId}:role/data-platform-redshift-role\' IGNOREHEADER 1 CSV', $.bucket, $.key)
+            ResultSelector:
+              Id.$: $.Id
+            ResultPath: $.Query
+            Next: Initialise number of attempts
+          
+          Initialise number of attempts:
+            Type: "Pass"
+            Parameters:
+              Id.$: "$.Query.Id"
+              Attempts: 0
+            ResultPath: "$.Query"
+            Next: "Wait before checking result"
+
+          Check number of attempts:
+            Type: "Choice"
+            Choices:
+              - Variable: "$.Query.Attempts"
+                NumericGreaterThanEquals: 10
+                Next: "Fail"
+            Default: "Wait before checking result"
+
+          Wait before checking result:
+            Type: Wait
+            Seconds: 30
+            Next: "Get result of Redshift query"
+          
+          Get result of Redshift query:
+            Type: "Task"
+            Resource: "arn:aws:states:::aws-sdk:redshiftdata:describeStatement"
+            Parameters:
+              Id.$: "$.Query.Id"
+            ResultSelector:
+              Status.$: "$.Status"
+            ResultPath: "$.Query.Result"
+            Next: "Increment number of attempts"
+
+          Increment number of attempts:
+            Type: "Pass"
+            Parameters:
+              Id.$: "$.Query.Id"
+              Attempts.$: "States.MathAdd($.Query.Attempts, 1)"
+              Result.$: "$.Query.Result"
+            ResultPath: "$.Query"
+            Next: "Check if query succeeded"
+            
+          Check if query succeeded:
+            Type: "Choice"
+            Choices:
+              - Variable: "$.Query.Result.Status"
+                StringEquals: "FINISHED"
+                Next: "Succeed"
+              - Or:
+                  - Variable: "$.Query.Result.Status"
+                    StringEquals: "FAILED"
+                  - Variable: "$.Query.Result.Status"
+                    StringEquals: "ABORTED"
+                Next: "Fail"
+            Default: "Check number of attempts"
+          
+          Fail:
+            Type: "Fail"
+
+          Succeed:
+            Type: "Succeed"

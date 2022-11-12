@@ -1,0 +1,27 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates a simple VPC for a Redshift cluster to be deployed into"
+
+Resources:
+  Vpc:
+    Type: "AWS::EC2::VPC"
+    Properties: 
+      CidrBlock: "10.0.0.0/16"
+      Tags:
+        - Key: "Name"
+          Value: "data-platform-vpc"
+  
+  Subnet:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      VpcId: !Ref "Vpc"
+      Tags:
+        - Key: "Name"
+          Value: "data-platform-subnet"
+
+Outputs:
+  DataPlatformSubnetId:
+    Export: 
+      Name: "DataPlatformSubnetId"
+    Description: "The ID of the subnet to create the Redshift cluster in"
+    Value: !Ref "Subnet"
